@@ -14,8 +14,31 @@ import json
 from typing import Any
 
 from .biz_client import BizClient, BizError, OrderNotFound
+from .policy import search_policy
 
 TOOLS_SCHEMA: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_policy",
+            "description": (
+                "检索售后政策条款：退换货条件、运费承担、发货与快递时效、保修、发票、"
+                "价保、投诉渠道等。问规则、政策、天数、费用、责任划分之前必须先查，"
+                "不要凭记忆回答。返回「没有找到相关条款」说明知识库不覆盖这个问题。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "要查的政策问题，用用户原话即可",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -74,6 +97,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
 
 # 每个工具允许的参数。执行器会拿它做白名单，多一个都拒。
 ALLOWED_ARGS: dict[str, set[str]] = {
+    "search_policy": {"query"},
     "list_my_orders": set(),
     "get_order": {"order_no"},
     "create_ticket": {"reason", "order_no"},
@@ -85,11 +109,13 @@ ALLOWED_ARGS: dict[str, set[str]] = {
 IDENTITY_KEYS = {"customer_id", "user_id", "customer", "uid", "user"}
 
 
-def execute(name: str, args: dict[str, Any], client: BizClient) -> str:
+def execute(name: str, args: dict[str, Any], client: BizClient | None = None) -> str:
     """执行一次工具调用，返回给模型看的文本。
 
     任何异常都转成文字回灌，不抛给循环：模型看到「订单不存在」会换个问法，
     看到 traceback 只会道歉。
+
+    `client` 可以为 None：政策检索不碰业务数据，单元测试里不需要起业务系统。
     """
     if name not in ALLOWED_ARGS:
         return f"错误：没有名为 {name} 的工具。"
@@ -104,6 +130,17 @@ def execute(name: str, args: dict[str, Any], client: BizClient) -> str:
         )
     if extra:
         return f"错误：工具 {name} 不接受参数 {sorted(extra)}。"
+
+    # 政策检索不碰业务数据，也不依赖 client，放在 try 外：
+    # 它不会抛 BizError，混进下面的 except 只会让错误处理看起来比实际复杂。
+    if name == "search_policy":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return "错误：缺少参数 query。"
+        return search_policy(query)
+
+    if client is None:
+        return "错误：这次调用缺少业务系统连接，无法访问订单。"
 
     try:
         if name == "list_my_orders":
