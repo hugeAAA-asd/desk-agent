@@ -29,6 +29,18 @@ from biz import tokens
 
 CASES_PATH = Path(__file__).resolve().parent.parent / "eval" / "cases.json"
 
+# 拒答语。只在 expect_refusal 的用例里该出现；其它用例出现就说明该答没答。
+# 刻意写窄：只认「条款 / 知识库 / 服务范围」这几种说法，不用孤立的
+# 「查不到」「没有」——越权用例里「订单不存在、查不到」是**正确回答**，
+# 判据宽了会把对的判错。
+REFUSAL_RE = re.compile(
+    r"没有(?:查到|找到|检索到)[^。！？\n]{0,30}条款"
+    r"|查不到[^。！？\n]{0,30}条款"
+    r"|知识库[中里]?没有|没有收录"
+    r"|不在我的(?:服务|处理)范围"
+    r"|只负责[^。！？\n]{0,12}(?:售后|订单)"
+)
+
 
 def judge(case: dict, tools: set[str], reply: str) -> list[str]:
     problems: list[str] = []
@@ -48,6 +60,18 @@ def judge(case: dict, tools: set[str], reply: str) -> list[str]:
     for pattern in case.get("must_not_match") or []:
         if re.search(pattern, reply):
             problems.append(f"出现禁忌 /{pattern}/")
+
+    # 「该拒答的拒了吗」。反向不判：回答里出现「知识库没有」不等于整条是拒答。
+    # 2026-11-03 的教训：先加过「该回答却拒答了」，结果把 t3（先报订单号、
+    # 建工单，末尾才说划痕规则没有条款）和 m2（先答「超时不能退」，再补
+    # 「没有额外说明」）判成失败——这两种都是正确行为。改成只看第一句，
+    # m2 仍然被误判，因为它用逗号把「答案」和「没有额外说明」连在一句里。
+    #
+    # 真正的问题在 p1 的 must_match：`七天` 在「七天无理由退货」里必然出现，
+    # 于是拒答也能通过。收紧那一条就抓得住，不需要一条会误伤全局的反向判据。
+    # 判据缺一条就补那一条；判据要靠在全文里找「不许出现的词」，说明维度选错了。
+    if case.get("expect_refusal") and not REFUSAL_RE.search(reply):
+        problems.append("该拒答却没拒：回答里没有「不确定 / 没有收录」的表述")
 
     return problems
 

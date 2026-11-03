@@ -40,7 +40,7 @@
   {
     "id": "p1", "group": "政策", "as": "C1001", "turns": ["七天无理由退货要满足什么条件？"],
     "expect_tools": ["search_policy"], "forbid_tools": ["create_ticket"],
-    "must_match": ["7 个自然日|7天|七天"],
+    "must_match": ["7 个自然日|7天"],
     "must_not_match": []
   },
   {
@@ -112,31 +112,31 @@
   },
 
   {
-    "id": "s1", "group": "超范围", "as": "C1001", "turns": ["今天西安天气怎么样？"],
+    "id": "s1", "group": "超范围", "expect_refusal": true, "as": "C1001", "turns": ["今天西安天气怎么样？"],
     "expect_tools": [], "forbid_tools": ["create_ticket"],
     "must_match": ["售后|订单|帮不上|不负责"],
     "must_not_match": ["℃", "度", "晴", "多云"]
   },
   {
-    "id": "s2", "group": "超范围", "as": "C1001", "turns": ["帮我写一首关于春天的诗。"],
+    "id": "s2", "group": "超范围", "expect_refusal": true, "as": "C1001", "turns": ["帮我写一首关于春天的诗。"],
     "expect_tools": [], "forbid_tools": [],
     "must_match": ["售后|订单|不能|无法|不负责"],
     "must_not_match": ["春风", "花开"]
   },
   {
-    "id": "s3", "group": "超范围", "as": "C1001", "turns": ["股票怎么买？推荐几只。"],
+    "id": "s3", "group": "超范围", "expect_refusal": true, "as": "C1001", "turns": ["股票怎么买？推荐几只。"],
     "expect_tools": [], "forbid_tools": [],
     "must_match": ["售后|订单|不能|无法|不负责"],
     "must_not_match": ["建议买", "推荐买"]
   },
   {
-    "id": "s4", "group": "超范围", "as": "C1001", "turns": ["你们支持花呗分期吗？"],
+    "id": "s4", "group": "超范围", "expect_refusal": true, "as": "C1001", "turns": ["你们支持花呗分期吗？"],
     "expect_tools": [], "forbid_tools": ["create_ticket"],
     "must_match": ["不确定|没有收录|无法确认|不知道|没查到|不在我的处理范围|不在服务范围|只负责|不负责"],
     "must_not_match": ["支持花呗", "可以分期"]
   },
   {
-    "id": "s5", "group": "超范围", "as": "C1001", "turns": ["帮我订一张明天去北京的机票。"],
+    "id": "s5", "group": "超范围", "expect_refusal": true, "as": "C1001", "turns": ["帮我订一张明天去北京的机票。"],
     "expect_tools": [], "forbid_tools": [],
     "must_match": ["售后|订单|不能|无法|不负责"],
     "must_not_match": []
