@@ -10,12 +10,14 @@
 """
 
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import audit
 from .biz_client import BizClient
 from .config import BIZ_BASE_URL, MAX_STEPS
-from .llm import call_llm
+from .llm import LLMError, call_llm, stream_chat
 from .session import Session
 from .tools import TOOLS_SCHEMA, execute
 
@@ -99,8 +101,26 @@ def _run_calls(calls: list[dict[str, Any]], session: Session, client: BizClient)
         name, args, error = _parse_call(call)
         result = error if error else execute(name, args, client)
         session.messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+        audit.record(
+            session_id=session.id,
+            customer_id=session.customer_id,
+            tool=name,
+            args=args,
+            result=result,
+            ok=_looks_ok(result),
+        )
         done.append(Step(tool=name, args=args, result=result))
     return done
+
+
+def _looks_ok(result: str) -> bool:
+    """工具返回的是给模型看的文本，没有结构化状态。
+
+    所有失败分支都以「错误」「调用失败」「订单不存在」开头（见 tools.execute），
+    所以前缀判断够用。真要精确，应该让 execute 返回 (text, ok)——但那会让
+    每个分支多一行解包，收益不值。
+    """
+    return not result.startswith(("错误", "调用失败", "订单不存在"))
 
 
 def _parse_call(call: dict[str, Any]) -> tuple[str, dict[str, Any], str | None]:
@@ -131,3 +151,97 @@ def _finalize(session: Session, steps: list[Step], rounds: int) -> Turn:
     if not reply:
         reply = "抱歉，这一轮没能查到结果。您可以换个说法，或者让我转人工处理。"
     return Turn(reply=reply, steps=steps, rounds=rounds, truncated=True)
+
+
+# ── 流式版本 ────────────────────────────────────────────────────────
+#
+# 和 run_turn 是两份代码而不是一份加开关，是有意的：流式的状态机更碎
+# （文本片段、工具阶段、收尾），硬塞进同一个函数会让两边都难读。
+# 代价是两份可能漂移——所以两者共用 _run_calls / _parse_call / ensure_system，
+# 只在「怎么产出结果」这一层分叉。
+
+
+def _step_dict(step: Step) -> dict[str, Any]:
+    return {"tool": step.tool, "args": step.args, "result": step.result}
+
+
+def _stream_once(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None):
+    """跑一次流式调用，边推 delta 边攒出完整 message。"""
+    message: dict[str, Any] | None = None
+    for kind, payload in stream_chat(messages, tools=tools):
+        if kind == "delta":
+            yield ("delta", payload)
+        else:
+            message = payload
+    if message is None:
+        raise LLMError("模型没有返回任何内容")
+    yield ("message", message)
+
+
+def run_turn_stream(
+    session: Session, user_text: str, client: BizClient | None = None
+) -> Iterator[dict[str, Any]]:
+    """产出三种事件：`step`（工具调用）、`delta`（文本片段）、`done`（收尾）。"""
+    ensure_system(session)
+    session.messages.append({"role": "user", "content": user_text})
+
+    owns_client = client is None
+    client = client or BizClient(BIZ_BASE_URL, session.token)
+    steps: list[Step] = []
+
+    try:
+        for round_no in range(1, MAX_STEPS + 1):
+            message: dict[str, Any] | None = None
+            for kind, payload in _stream_once(session.messages, TOOLS_SCHEMA):
+                if kind == "delta":
+                    yield {"type": "delta", "text": payload}
+                else:
+                    message = payload
+            if message is None:
+                raise LLMError("模型没有返回任何内容")
+
+            session.messages.append(message)
+            calls = message.get("tool_calls") or []
+            if not calls:
+                session.touch()
+                yield {
+                    "type": "done",
+                    "reply": (message.get("content") or "").strip(),
+                    "steps": [_step_dict(s) for s in steps],
+                    "rounds": round_no,
+                    "truncated": False,
+                }
+                return
+
+            for call in calls:
+                for step in _run_calls([call], session, client):
+                    steps.append(step)
+                    yield {"type": "step", **_step_dict(step)}
+
+        # 轮次用尽：补跑未执行的工具，再不带工具流式收尾
+        last = session.messages[-1]
+        if last.get("role") == "assistant" and last.get("tool_calls"):
+            for step in _run_calls(last["tool_calls"], session, client):
+                steps.append(step)
+                yield {"type": "step", **_step_dict(step)}
+
+        message = None
+        for kind, payload in _stream_once(session.messages, None):
+            if kind == "delta":
+                yield {"type": "delta", "text": payload}
+            else:
+                message = payload
+        session.messages.append(message or {"role": "assistant", "content": ""})
+        session.touch()
+
+        reply = ((message or {}).get("content") or "").strip()
+        yield {
+            "type": "done",
+            "reply": reply or "抱歉，这一轮没能查到结果。您可以换个说法，或者让我转人工处理。",
+            "steps": [_step_dict(s) for s in steps],
+            "rounds": MAX_STEPS,
+            "truncated": True,
+        }
+    finally:
+        if owns_client:
+            client.close()

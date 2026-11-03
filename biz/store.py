@@ -10,6 +10,7 @@
 「查谁的单」由服务端从 token 注入——两件事分开做，缺一个都能被绕过。
 """
 
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -48,12 +49,20 @@ CREATE TABLE IF NOT EXISTS tickets (
     order_no    TEXT,
     reason      TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'open',
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    idem_key    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_customer ON tickets(customer_id);
 """
+
+# 唯一索引单独放：老库迁移加列之前建它会报「no such column」。
+INDEXES = "CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_idem ON tickets(idem_key);"
+
+# 轻量迁移：老库（Day 1 建的）没有 idem_key 列，建表语句又不会给已存在的表加列。
+# 演示项目不引迁移框架，但也不能要求用户删库重来。
+MIGRATIONS = [("tickets", "idem_key", "idem_key TEXT")]
 
 # 订单状态取值：paid 已付款 / shipped 已发货 / delivered 已签收 /
 # refunded 已退款 / closed 已关闭。答复里说「到哪了」靠的是这张表，
@@ -93,10 +102,20 @@ def connect() -> Iterator[sqlite3.Connection]:
 
 
 def init_db() -> None:
-    """建表。幂等，可重复调用。"""
+    """建表 + 迁移 + 索引。幂等，可重复调用。"""
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.executescript(INDEXES)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """给老库补列。演示项目不引迁移框架，但也不该要求用户删库重来。"""
+    for table, column, ddl in MIGRATIONS:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def is_empty() -> bool:
@@ -155,29 +174,59 @@ def list_tickets(customer_id: str) -> list[dict[str, Any]]:
         return _rows(cur)
 
 
-def create_ticket(customer_id: str, reason: str, order_no: str | None = None) -> dict[str, Any]:
-    """建工单。
+def create_ticket(
+    customer_id: str, reason: str, order_no: str | None = None
+) -> tuple[dict[str, Any], bool]:
+    """建工单，返回 `(工单, 是否复用了已有工单)`。
 
-    如果指定了订单号，先确认这单属于当前客户——否则模型只要拿到别人的
-    单号，就能把工单挂到别人名下。这是越权的第二道关：第一道在查询，
-    第二道在写入。
+    幂等键由业务系统自己算，**不交给 Agent 传**：Agent 传的东西模型能影响
+    （它把描述改写一遍就能绕过去），而重复提交恰恰是模型最容易干的事——
+    用户说一次「开工单」，模型可能因为没看到工具结果而重试两次。
+
+    键的构成是「谁 + 哪个单 + 说了什么」：同一客户对同一订单、同一段描述，
+    只落一条。用户改主意换了说法，就是另一张单，这是合理的。
     """
     if order_no:
         get_order(customer_id, order_no)  # 不属于自己会抛 OrderNotFound
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ticket_no = f"TK{datetime.now():%Y%m%d}{uuid.uuid4().hex[:4].upper()}"
+    idem_key = hashlib.sha256(
+        f"{customer_id}|{order_no or ''}|{reason.strip()}".encode()
+    ).hexdigest()[:32]
 
     with connect() as conn:
-        conn.execute(
-            "INSERT INTO tickets (ticket_no, customer_id, order_no, reason, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'open', ?)",
-            (ticket_no, customer_id, order_no, reason, now),
-        )
-    return {
-        "ticket_no": ticket_no,
-        "order_no": order_no,
-        "reason": reason,
-        "status": "open",
-        "created_at": now,
-    }
+        existing = conn.execute(
+            "SELECT ticket_no, order_no, reason, status, created_at "
+            "FROM tickets WHERE idem_key = ?",
+            (idem_key,),
+        ).fetchone()
+        if existing:
+            return dict(existing), True
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ticket_no = f"TK{datetime.now():%Y%m%d}{uuid.uuid4().hex[:4].upper()}"
+        try:
+            conn.execute(
+                "INSERT INTO tickets "
+                "(ticket_no, customer_id, order_no, reason, status, created_at, idem_key) "
+                "VALUES (?, ?, ?, ?, 'open', ?, ?)",
+                (ticket_no, customer_id, order_no, reason, now, idem_key),
+            )
+        except sqlite3.IntegrityError:
+            # 并发下两个请求同时通过了上面的查询，唯一索引兜住第二个
+            row = conn.execute(
+                "SELECT ticket_no, order_no, reason, status, created_at "
+                "FROM tickets WHERE idem_key = ?",
+                (idem_key,),
+            ).fetchone()
+            return dict(row), True
+
+    return (
+        {
+            "ticket_no": ticket_no,
+            "order_no": order_no,
+            "reason": reason,
+            "status": "open",
+            "created_at": now,
+        },
+        False,
+    )

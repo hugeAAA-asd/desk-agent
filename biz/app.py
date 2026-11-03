@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from . import seed, store, tokens
@@ -154,12 +154,21 @@ def list_tickets(customer_id: Customer) -> list[TicketOut]:
 
 
 @app.post("/tickets", response_model=TicketOut, status_code=201)
-def create_ticket(body: TicketIn, customer_id: Customer) -> TicketOut:
-    """建工单。关联订单时同样做归属校验——写入侧是越权的第二道关。"""
+def create_ticket(body: TicketIn, response: Response, customer_id: Customer) -> TicketOut:
+    """建工单。关联订单时同样做归属校验——写入侧是越权的第二道关。
+
+    重复提交返回 200 而不是 201，并带 `X-Idempotent-Replay: true`。
+    区分状态码是给调用方看的：201 是「真的建了」，200 是「已经有了」。
+    两者都返回同一张工单，调用方拿到的单号不会变。
+    """
     try:
-        ticket = store.create_ticket(customer_id, body.reason, body.order_no)
+        ticket, replay = store.create_ticket(customer_id, body.reason, body.order_no)
     except store.OrderNotFound:
         raise HTTPException(status_code=404, detail="订单不存在") from None
+
+    if replay:
+        response.status_code = status.HTTP_200_OK
+        response.headers["X-Idempotent-Replay"] = "true"
     return TicketOut(**ticket)
 
 

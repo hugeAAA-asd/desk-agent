@@ -53,7 +53,7 @@ class BizClient:
 
     # ── 内部 ────────────────────────────────────────────────────────────
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _request(self, method: str, path: str, with_response: bool = False, **kwargs: Any) -> Any:
         try:
             resp = self._client.request(method, path, **kwargs)
         except httpx.HTTPError as exc:
@@ -67,7 +67,8 @@ class BizClient:
         if resp.status_code >= 400:
             detail = _detail(resp)
             raise BizError(resp.status_code, f"业务系统返回 {resp.status_code}：{detail}")
-        return resp.json()
+        data = resp.json()
+        return (data, resp) if with_response else data
 
     # ── 对外 ────────────────────────────────────────────────────────────
 
@@ -80,11 +81,20 @@ class BizClient:
     def get_order(self, order_no: str) -> dict[str, Any]:
         return self._request("GET", f"/orders/{order_no}")
 
-    def create_ticket(self, reason: str, order_no: str | None = None) -> dict[str, Any]:
+    def create_ticket(
+        self, reason: str, order_no: str | None = None
+    ) -> tuple[dict[str, Any], bool]:
+        """返回 `(工单, 是否重复提交)`。
+
+        幂等判定在业务系统里做，这里只负责把它的答复翻译成布尔值：
+        `X-Idempotent-Replay: true` 表示「你要的这张单已经存在」。
+        """
         payload: dict[str, Any] = {"reason": reason}
         if order_no:
             payload["order_no"] = order_no
-        return self._request("POST", "/tickets", json=payload)
+        data, resp = self._request("POST", "/tickets", with_response=True, json=payload)
+        replay = resp.headers.get("X-Idempotent-Replay") == "true"
+        return data, replay
 
 
 def _detail(resp: httpx.Response) -> str:

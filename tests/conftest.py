@@ -49,9 +49,16 @@ def transport(biz):
             headers=headers,
             content=request.content,
         )
+        # 转发**全部**响应头，只剔除逐跳字段。只转 content-type 会丢掉
+        # X-Idempotent-Replay 这类自定义头，让幂等测试假绿——第一次就是这么坑的。
+        forward = {
+            k: v
+            for k, v in resp.headers.items()
+            if k.lower() not in ("content-length", "transfer-encoding", "connection")
+        }
         return httpx.Response(
             status_code=resp.status_code,
-            headers={"content-type": resp.headers.get("content-type", "application/json")},
+            headers=forward,
             content=resp.content,
         )
 

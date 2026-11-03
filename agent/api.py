@@ -11,14 +11,19 @@
 代价是每次建会话多一次 HTTP 往返。这个代价比「两套认证逻辑各写一遍」便宜。
 """
 
+import json
+from collections.abc import Iterator
 from typing import Annotated, Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .biz_client import BizClient, BizError
-from .config import BIZ_BASE_URL
-from .loop import run_turn
+from .config import BASE_DIR, BIZ_BASE_URL
+from .llm import LLMError
+from .loop import run_turn, run_turn_stream
 from .session import Session, store
 
 
@@ -80,29 +85,36 @@ def healthz() -> HealthOut:
     return HealthOut(status="ok", sessions=store.count())
 
 
-@app.post("/chat", response_model=ChatOut)
-def chat(body: ChatIn, token: Token) -> ChatOut:
-    session: Session | None = None
-    if body.session_id:
-        session = store.get(body.session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="会话不存在或已过期")
+def _prepare(body: ChatIn, token: str) -> tuple[Session, BizClient]:
+    """取会话、建客户端、必要时让业务系统认一次人。
+
+    两个端点共用这一段：认证逻辑写两遍迟早不一致，而不一致的后果是
+    「流式能进、普通不能进」这种最难查的现象。
+    """
+    session = store.get(body.session_id) if body.session_id else None
+    if body.session_id and session is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
 
     client = _client_factory(token)
-    try:
-        if session is None:
-            # 新会话：先让业务系统认一次人。token 无效在这里就挡掉，
-            # 不用等到模型调工具才发现。
-            try:
-                client.me()
-            except BizError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=exc.message,
-                    headers={"WWW-Authenticate": "Bearer"},
-                ) from None
-            session = store.create(token)
+    if session is not None:
+        return session, client
 
+    try:
+        me = client.me()
+    except BizError as exc:
+        client.close()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=exc.message,
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from None
+    return store.create(token, customer_id=str(me.get("id") or "")), client
+
+
+@app.post("/chat", response_model=ChatOut)
+def chat(body: ChatIn, token: Token) -> ChatOut:
+    session, client = _prepare(body, token)
+    try:
         turn = run_turn(session, body.message, client)
     finally:
         client.close()
@@ -116,7 +128,54 @@ def chat(body: ChatIn, token: Token) -> ChatOut:
     )
 
 
+@app.post("/chat/stream")
+def chat_stream(body: ChatIn, token: Token) -> StreamingResponse:
+    """SSE 版本：工具调用以 `step` 事件推、正文以 `delta` 事件推、最后 `done`。
+
+    用 POST 而不是 EventSource：浏览器原生的 EventSource 只支持 GET，
+    带不了请求体和 Authorization 头。前端用 fetch + ReadableStream 读，
+    代价是要自己解析 `data:` 行，收益是不用把消息塞进 URL。
+    """
+    session, client = _prepare(body, token)
+
+    def events() -> Iterator[str]:
+        try:
+            for event in run_turn_stream(session, body.message, client):
+                if event.get("type") == "done":
+                    # 会话 id 属于传输层，不让 loop 去关心；但它必须随 done 下发，
+                    # 否则前端第二轮拿不到 id，多轮对话就断了。
+                    event["session_id"] = session.id
+                yield _sse(event)
+        except LLMError as exc:
+            yield _sse({"type": "error", "message": str(exc)})
+        finally:
+            client.close()
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # nginx 默认会把响应攒够一个 buffer 再发，流式就变成「等 10 秒一次吐完」
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
 @app.delete("/sessions/{session_id}")
 def drop_session(session_id: str) -> dict[str, bool]:
     store.drop(session_id)
     return {"dropped": True}
+
+
+# 演示页和接口同源，省掉 CORS：跨域配置一旦写宽（allow_origins=["*"]），
+# 带着 Authorization 的请求就能被任意站点发起，等于把 token 交出去。
+_WEB_DIR = BASE_DIR / "web"
+if _WEB_DIR.exists():
+    app.mount("/ui", StaticFiles(directory=_WEB_DIR, html=True), name="ui")

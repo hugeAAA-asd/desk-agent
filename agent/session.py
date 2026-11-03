@@ -25,6 +25,7 @@ TTL_SECONDS = 3600
 class Session:
     id: str
     token: str
+    customer_id: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -47,10 +48,10 @@ class SessionStore:
         self._ttl = ttl
         self._lock = threading.Lock()
 
-    def create(self, token: str) -> Session:
+    def create(self, token: str, customer_id: str = "") -> Session:
         with self._lock:
             self._purge_locked()
-            session = Session(id=uuid.uuid4().hex[:12], token=token)
+            session = Session(id=uuid.uuid4().hex[:12], token=token, customer_id=customer_id)
             self._sessions[session.id] = session
             return session
 

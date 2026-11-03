@@ -63,7 +63,10 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "properties": {
                     "order_no": {
                         "type": "string",
-                        "description": "订单号，形如 SF20261028001",
+                        # 示例必须用不存在的号：schema 会进模型上下文，写真实单号
+                        # 等于把某个客户的订单号告诉所有用户。评测里模型就拿它
+                        # 当例子报给了另一个客户（x2）。
+                        "description": "订单号，14 位，SF 开头，如 SF20260101000",
                     }
                 },
                 "required": ["order_no"],
@@ -154,7 +157,13 @@ def execute(name: str, args: dict[str, Any], client: BizClient | None = None) ->
             reason = (args.get("reason") or "").strip()
             if len(reason) < 2:
                 return "错误：reason 太短，请让用户补充问题描述。"
-            ticket = client.create_ticket(reason, args.get("order_no") or None)
+            ticket, replay = client.create_ticket(reason, args.get("order_no") or None)
+            if replay:
+                # 明确告诉模型「没重复建」，否则它可能以为失败又试一次
+                return (
+                    f"工单 {ticket['ticket_no']} 已经存在（同一问题重复提交，未重复创建），"
+                    f"状态：待处理。请把这个工单号告诉用户，不要再次创建。"
+                )
             return (
                 f"已创建工单 {ticket['ticket_no']}（状态：待处理），"
                 f"关联订单：{ticket['order_no'] or '无'}。请把工单号告诉用户。"
