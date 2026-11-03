@@ -21,11 +21,19 @@ import re
 import sys
 from pathlib import Path
 
-from agent.biz_client import BizClient
-from agent.config import BIZ_BASE_URL
-from agent.loop import run_turn
-from agent.session import Session
-from biz import tokens
+# 让 PyCharm 的右键 Run 也能跑：直接运行脚本时 __package__ 为空，sys.path[0]
+# 是 scripts/ 而不是项目根，`agent` 包就找不到了。用 `-m scripts.eval_agent`
+# 不会有这个问题（那时 __package__ 是 "scripts"）。两种方式都支持。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import httpx  # noqa: E402
+
+from agent.biz_client import BizClient  # noqa: E402
+from agent.config import BIZ_BASE_URL  # noqa: E402
+from agent.loop import run_turn  # noqa: E402
+from agent.session import Session  # noqa: E402
+from biz import tokens  # noqa: E402
 
 CASES_PATH = Path(__file__).resolve().parent.parent / "eval" / "cases.json"
 
@@ -109,6 +117,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if not cases:
         print("没有匹配的用例")
+        return 1
+
+    # 业务系统没起时，30 条会全部报「业务系统连不上」，看不出是环境问题。
+    # 这里主动探一次 /healthz，直接说清楚要做什么。
+    try:
+        httpx.get(f"{BIZ_BASE_URL.rstrip('/')}/healthz", timeout=2.0).raise_for_status()
+    except Exception:  # noqa: BLE001 - 探活失败只给提示
+        print(f"业务系统没起来（{BIZ_BASE_URL}）。先启动它，再跑评测：")
+        print("    PyCharm 里右键 scripts/run_biz.py → Run")
+        print(r"    或 .venv\Scripts\python.exe -m uvicorn biz.app:app --port 8000")
+        return 2
         return 1
 
     print(f"共 {len(cases)} 条，模型调用中…\n")
