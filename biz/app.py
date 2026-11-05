@@ -56,6 +56,14 @@ class OrderOut(BaseModel):
     created_at: str
 
 
+class OrderSummaryOut(BaseModel):
+    status: str
+    status_text: str
+    order_count: int
+    total_amount: float
+    ticket_count: int
+
+
 class TicketIn(BaseModel):
     reason: str = Field(min_length=2, max_length=200, description="问题描述")
     order_no: str | None = Field(default=None, description="关联订单号，可空")
@@ -130,6 +138,20 @@ def list_orders(customer_id: Customer) -> list[OrderOut]:
     return [
         OrderOut(**o, status_text=store.ORDER_STATUS.get(o["status"], o["status"]))
         for o in store.list_orders(customer_id)
+    ]
+
+
+@app.get("/orders/summary", response_model=list[OrderSummaryOut])
+def summarize_orders(customer_id: Customer) -> list[OrderSummaryOut]:
+    """我的订单按状态汇总：单数、金额、涉及的工单数。
+
+    路由顺序有讲究：这条必须写在 `/orders/{order_no}` **前面**。
+    Starlette 按注册顺序匹配，动态路由在前的话，请求 /orders/summary
+    会先撞上它，order_no 被赋成字符串 "summary"，然后 404。
+    """
+    return [
+        OrderSummaryOut(**s, status_text=store.ORDER_STATUS.get(s["status"], s["status"]))
+        for s in store.summarize_orders(customer_id)
     ]
 
 

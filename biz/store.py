@@ -90,6 +90,10 @@ def connect() -> Iterator[sqlite3.Connection]:
     """每次操作用独立连接：FastAPI 的同步端点跑在线程池里，
     共享一个连接会撞 `check_same_thread`，而加锁又把并发读退化成串行。
     SQLite 开 WAL 后多读一写可以并行，代价只是多几次 open()。
+
+    事务边界就是这一个 `with`：正常结束 commit，抛异常 rollback。
+    之前只写 commit、靠 `close()` 隐式回滚——SQLite 确实会回滚，
+    但那是「碰巧对」，读代码的人看不出这里管着事务。
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -97,6 +101,9 @@ def connect() -> Iterator[sqlite3.Connection]:
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -170,6 +177,42 @@ def list_tickets(customer_id: str) -> list[dict[str, Any]]:
             "SELECT ticket_no, order_no, reason, status, created_at "
             "FROM tickets WHERE customer_id = ? ORDER BY created_at DESC",
             (customer_id,),
+        )
+        return _rows(cur)
+
+
+def summarize_orders(customer_id: str) -> list[dict[str, Any]]:
+    """按订单状态汇总：几单、总金额、涉及几张工单。
+
+    这里有个**一对多 JOIN 的坑**，写法分两层看：
+
+    直觉版是这样：`LEFT JOIN tickets ON tickets.order_no = orders.order_no`，
+    然后 `COUNT(*)` 数订单、`SUM(amount)` 加金额。
+    但一个订单可以有多张工单，JOIN 之后左表的行会**重复**：
+    两单各挂两张工单 → `COUNT(*)` 变成 4、`SUM(amount)` 把金额加了两遍。
+    汇总数字静默偏大，是最难发现的那类错——它不报错，只是算错。
+
+    所以先用子查询把「每单几张工单」压成一行，再 LEFT JOIN 回订单表：
+    一个订单对一行工单统计，`COUNT(*)` 才是订单数、`SUM(amount)` 才是真金额。
+
+    为什么用 LEFT JOIN 不是 INNER JOIN：没提过工单的订单也必须算进汇总，
+    INNER JOIN 会把它们整行丢掉——统计的是「我的全部订单」，不是「我提过工单的订单」。
+    """
+    with connect() as conn:
+        cur = conn.execute(
+            "SELECT o.status, "
+            "       COUNT(*) AS order_count, "
+            "       SUM(o.amount) AS total_amount, "
+            "       COALESCE(SUM(t.ticket_count), 0) AS ticket_count "
+            "FROM orders o "
+            "LEFT JOIN ( "
+            "    SELECT order_no, COUNT(*) AS ticket_count "
+            "    FROM tickets WHERE customer_id = ? GROUP BY order_no "
+            ") t ON t.order_no = o.order_no "
+            "WHERE o.customer_id = ? "
+            "GROUP BY o.status "
+            "ORDER BY total_amount DESC",
+            (customer_id, customer_id),
         )
         return _rows(cur)
 
